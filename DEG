@@ -1,0 +1,188 @@
+library(DESeq2)
+library(stringr)
+library(curl)
+
+
+rm(list = ls())    #清除多余变量
+setwd("C:\\Users\\wang9\\Desktop\\数据处理\\差异分析")
+mycounts<-read.csv("汇总.csv")
+
+rownames(mycounts)<-mycounts[,1]
+mycounts<-mycounts[,-1]
+head(mycounts)
+
+
+condition <- factor(c(rep("N",25),rep("T",25)), levels = c("N","T"))
+condition
+
+colData <- data.frame(row.names=colnames(mycounts), condition)
+colData   #colData
+
+dds <- DESeqDataSetFromMatrix(mycounts, colData, design= ~ condition)  #正式构建dds矩阵
+
+dds_norm <- DESeq(dds)   #dds标准化
+dds_norm                 #查看标准化后的数据
+
+normalized_counts <- counts(dds_norm, normalized=TRUE)    #获取标准化后的数据
+head(normalized_counts)
+   
+#根据基因在不同的样本中表达变化的差异程度mad值对数据排序，差异越大的基因排位越前。
+normalized_counts_mad <- apply(normalized_counts, 1, mad)
+normalized_counts <- normalized_counts[order(normalized_counts_mad, decreasing=T), ]
+
+# 标准化后的数据输出
+write.table(normalized_counts, file="dds_normalized_counts.xls",
+                   quote=F, sep="\t", row.names=T, col.names=T)
+
+
+rld <- rlog(dds_norm, blind=FALSE)     #log转化
+rlogMat <- assay(rld)
+rlogMat <- rlogMat[order(normalized_counts_mad, decreasing=T), ]
+#把log转化后的数据再输出一个表格
+write.table(rlogMat, file="dds_normalized_counts_rlog.xls",
+             quote=F, sep="\t", row.names=T, col.names=T)
+
+
+res = results(dds_norm, contrast=c("condition", "N", "T"))
+res = res[order(res$pvalue),]  #按照p-value排序
+head(res)
+
+summary(res) # 对res矩阵进行总结，利用summary命令统计显示一共多少个genes上调和下调
+
+write.csv(res,file="All_results.csv")  #将所有的数据输出
+table(res$padj<0.05)           #取padj小于0.05的数据，得到31行
+
+diff_gene_deseq2 <-subset(res,padj < 0.05 & (log2FoldChange > 1 | log2FoldChange < -1))
+dim(diff_gene_deseq2)
+head(diff_gene_deseq2)
+
+write.csv(diff_gene_deseq2,file= "DEG_treat_vs_control.csv") 
+#把所有的差异表达基因输出一个文件
+
+library('biomaRt')#载入R包，要用bioMart包从ensembl数据库获得基因的注释
+library("curl")
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))   #用useMart函数选定数据库，用useDataset()函数选定数据库中的基因组
+
+
+my_ensembl_gene_id<-row.names(diff_gene_deseq2)
+hg_symbols<- getBM(attributes=c('ensembl_gene_id','external_gene_name',"description"),
+                   filters = 'ensembl_gene_id', values = my_ensembl_gene_id, mart = mart)
+
+head(hg_symbols)
+
+ensembl_gene_id<-rownames(diff_gene_deseq2)
+diff_gene_deseq2<-cbind(ensembl_gene_id,diff_gene_deseq2)
+colnames(diff_gene_deseq2)[1]<-c("ensembl_gene_id")
+diff_name<-merge(diff_gene_deseq2,hg_symbols,by="ensembl_gene_id")
+#把注释文件和基因表达量文件合并起来
+head(diff_name)
+
+
+
+#MA plot 
+
+library(ggplot2)
+library(BiocGenerics)
+plotMA(res,ylim=c(-2,2))
+topGene <- rownames(res)[which.min(res$padj)]
+with(res[topGene, ], {
+  points(baseMean, log2FoldChange, col="dodgerblue", cex=6, lwd=2)
+  text(baseMean, log2FoldChange, topGene, pos=2, col="dodgerblue")
+})
+
+
+
+
+res_order<-res[order(row.names(res)),] 
+#前面res结果已经按padj排序了，所以这次要按照行名升序再排列回来，否则和dds不一致,也可重新进行标准化操作
+res = res_order  #重新标准化新的矩阵可不重新排序
+
+
+res.shrink <- lfcShrink(dds_norm, contrast = c("condition","N","T"), res=res)
+plotMA(res.shrink, main="DESeq2", ylim = c(-5,5))
+topGene <- rownames(res)[which.min(res$padj)]
+ with(res[topGene, ], {
+          points(baseMean, log2FoldChange, col="dodgerblue", cex=2, lwd=2)
+          text(baseMean, log2FoldChange, topGene, pos=2, col="dodgerblue")
+        })
+
+
+
+BiocManager::install("EnhancedVolcano")
+BiocManager::install("airway")
+library(EnhancedVolcano)
+library(airway)
+EnhancedVolcano(res,
+                lab = rownames(res),
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                xlim = c(-8, 8),
+                title = 'resistant versus control',
+                pCutoff = 10e-17,
+                FCcutoff = 1,
+                pointSize = 1.5,
+                labSize = 3.0,
+                col=c('black', 'blue', 'green', 'red1'),
+                colAlpha = 1,
+                legend=c('NS','Log2 fold-change','P value',
+                         'P value & Log2 fold-change'),
+                legendPosition = 'right',
+                legendLabSize = 14,
+                legendIconSize = 5.0,
+)
+
+
+#某一个基因箱图
+plotCounts(dds, gene="ENSG00000240453", intgroup="condition", returnData=TRUE) %>%
+     ggplot(aes(condition, count)) + geom_boxplot(aes(fill=condition)) + scale_y_log10() + ggtitle("CNN2")
+
+
+#DESeq2包中专门由一个PCA分析的函数，采用vst标准化，30个样本以下可用rlog
+vsdata <- vst(dds, blind=FALSE)
+plotPCA(vsdata, intgroup="condition")
+
+
+#count matrix 热图
+library("pheatmap")
+ntd <- normTransform(dds_norm)
+select<-order(rowMeans(counts(dds_norm, normalized = TRUE)),decreasing = TRUE)[1:100]   #前50行
+df <- as.data.frame(colData(dds_norm)[,c("condition","sizeFactor")])
+pheatmap(assay(ntd)[select,], cluster_rows=FALSE, show_rownames=FALSE,cluster_cols=FALSE, annotation_col=df)
+
+
+#sample-to-sample distances热图
+library("RColorBrewer")
+sampleDists <- dist(t(assay(vsdata)))
+sampleDistMatrix <- as.matrix(sampleDists)
+rownames(sampleDistMatrix) <- paste(vsdata$condition, vsdata$type, sep="-")
+colnames(sampleDistMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Oranges")) )(255)
+pheatmap(sampleDistMatrix,
+                            clustering_distance_rows=sampleDists,
+                              clustering_distance_cols=sampleDists,
+                              col=colors)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
